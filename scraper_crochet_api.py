@@ -2,216 +2,319 @@
 # -*- coding: utf-8 -*-
 """
 =============================================================
-SCRAPER ETICO PARA NICHO CROCHET - "Crochet para Aprender"
+SCRAPER ETICO SIN API - "Crochet para Aprender"
 =============================================================
-Objetivo: Encontrar personas interesadas en aprender crochet
-(leads calificados) de forma 100% legal y etica.
+Busca leads (personas con intencion de aprender crochet) en los
+comentarios PUBLICOS de videos de YouTube, SIN necesidad de API key.
 
-METODO 1 (RECOMENDADO): YouTube Data API v3 (oficial y legal)
-   - Extrae comentarios de videos de crochet con intencion de compra
-     ("quiero aprender", "donde compro el curso?", "me interesa")
-   - Requiere API key gratuita de Google Cloud
+COMO FUNCIONA:
+  1. Descarga el HTML publico de cada video (con pausas de cortesia).
+  2. Extrae el JSON embebido (ytInitialData) donde YouTube guarda
+     los comentarios visibles.
+  3. Filtra los comentarios que muestran intencion de aprender/comprar.
+  4. Guarda los leads en leads_crochet.json
 
-METODO 2: Scraper web generico CON PERMISO (blogs/propios sitios)
-   - Respeta robots.txt automaticamente
-   - Pausas obligatorias entre solicitudes
-   - User-Agent identificable
+NOTA: YouTube solo incluye los primeros comentarios en el HTML inicial.
+Este script carga hasta 2 paginas adicionales de comentarios mediante
+el token de continuacion. Para volumen alto, usa la API oficial v3.
 
-REGLAS DE ORO IMPLEMENTADAS EN EL CODIGO:
-   - Revision automatica de robots.txt
-   - Pausas de cortesia (5-10 segundos entre solicitudes)
-   - Solo datos publicos y no sensibles
-   - User-Agent transparente (identifica tu bot)
-   - NO extrae correos, telefonos ni datos personales sensibles
-   - NO sobrecarga servidores
+REGLAS DE ORO IMPLEMENTADAS:
+  - Pausas de 6-12 s entre solicitudes (cortesia / anti-sobrecarga)
+  - User-Agent transparente con TU correo de contacto
+  - Solo comentarios PUBLICOS; nunca datos privados
+  - NO extrae correos, telefonos ni datos sensibles
 
 Requisitos:
-    pip install requests beautifulsoup4 google-api-python-client
+    pip install -r requirements.txt
 """
 
-import time
-import random
 import json
-from urllib import robotparser
-from urllib.parse import urljoin, urlparse
+import random
+import re
+import time
+import unicodedata
 
 import requests
-from bs4 import BeautifulSoup
 
 # ============================================================
-# CONFIGURACION
+# CONFIGURACION — EDITA ESTO
 # ============================================================
-PAUSA_MIN = 5       # segundos minimos entre solicitudes (cortesia)
-PAUSA_MAX = 10      # segundos maximos (aleatorio para parecer humano)
-USER_AGENT = "CrochetParaAprenderBot/1.0 (contacto: tucorreo@ejemplo.com)"
-# IMPORTANTE: Pon TU correo real. Un bot identificable = respetuoso.
+USER_AGENT = "CrochetParaAprenderBot/1.0 (contacto: eldisyerar@gmail.com)"
+# IMPORTANTE: cambia 'eldisyerar@gmail.com' por TU correo real.
 
-PALABRAS_CLAVE_INTENCION = [
-    "quiero aprender", "como aprendo", "como aprendo", "me interesa",
-    "donde compro", "donde compro", "cuanto cuesta", "cuanto cuesta",
-    "necesito un curso", "recomiendan curso", "soy principiante",
-    "recien empiezo", "quiero empezar", "algun curso", "algun curso"
+PAUSA_MIN = 6        # segundos minimos entre solicitudes
+PAUSA_MAX = 12       # segundos maximos (aleatorio, comportamiento humano)
+PAGINAS_EXTRA = 2    # paginas de comentarios adicionales por video
+
+# Agrega aqui los URLs de videos de crochet (idealmente de tu propio canal)
+VIDEOS = [
+    "https://www.youtube.com/watch?v=XXXXXXXXXXX",
+    # "https://www.youtube.com/watch?v=YYYYYYYYYYY",
 ]
 
+PALABRAS_CLAVE_INTENCION = [
+    "quiero aprender", "como aprendo", "me interesa",
+    "donde compro", "cuanto cuesta", "cuanto vale",
+    "necesito un curso", "recomiendan curso", "recomiendan algun curso",
+    "soy principiante", "recien empiezo", "quiero empezar",
+    "algun curso", "venden el curso", "tienen curso",
+    "como me inscribo", "donde lo consigo", "haces algun curso",
+]
+
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept-Language": "es-419,es;q=0.9",
+}
+
+# Pre-calcular las palabras clave sin acentos para comparar
+_CLAVES = None
+
+
+def _claves_normalizadas():
+    global _CLAVES
+    if _CLAVES is None:
+        _CLAVES = [normalizar(k) for k in PALABRAS_CLAVE_INTENCION]
+    return _CLAVES
+
+
+def normalizar(texto):
+    """Minusculas y sin acentos, para comparar 'cuanto' == 'cuánto'."""
+    texto = texto.lower()
+    return "".join(
+        c for c in unicodedata.normalize("NFD", texto)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def es_intencion(texto):
+    t = normalizar(texto)
+    return any(clave in t for clave in _claves_normalizadas())
+
+
 # ============================================================
-# METODO 1: YOUTUBE DATA API v3 (LEGAL - API OFICIAL)
+# UTILIDADES DE RED (con cortesia)
 # ============================================================
 
-def buscar_leads_youtube(api_key, max_videos=5, max_comentarios=50):
-    """
-    Busca videos de crochet y extrae comentarios con intencion de compra.
-    Usa la API OFICIAL de YouTube (cumple Terminos de Servicio).
+def id_de_video(url):
+    m = re.search(r"(?:v=|youtu\.be/|shorts/)([\w\-]{11})", url)
+    return m.group(1) if m else None
 
-    Como obtener tu API key GRATIS (5 minutos):
-    1. Ve a https://console.cloud.google.com
-    2. Crea un proyecto nuevo (ej: "crochet-leads")
-    3. Activa "YouTube Data API v3"
-    4. Credenciales -> Crear clave API
-    5. Listo! Copiala y pegala abajo.
-    """
-    from googleapiclient.discovery import build
 
-    youtube = build("youtube", "v3", developerKey=api_key)
-
-    # 1. Buscar videos populares de crochet
-    print("\nBuscando videos de crochet...")
-    busqueda = youtube.search().list(
-        q="aprender crochet principiantes",
-        part="snippet",
-        type="video",
-        maxResults=max_videos,
-        order="viewCount"
-    ).execute()
-
-    leads = []
-
-    for item in busqueda.get("items", []):
-        video_id = item["id"]["videoId"]
-        titulo = item["snippet"]["title"]
-        print("  Analizando: " + titulo)
-
-        # Pausa de cortesia (aunque la API lo permita, seamos gentiles)
-        time.sleep(random.uniform(2, 4))
-
-        # 2. Extraer comentarios del video
+def obtener_html(session, url, intentos=3):
+    for i in range(intentos):
         try:
-            comentarios = youtube.commentThreads().list(
-                part="snippet",
-                videoId=video_id,
-                maxResults=max_comentarios,
-                order="relevance"
-            ).execute()
+            r = session.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            return r.text
+        except requests.RequestException as e:
+            print("    reintento " + str(i + 1) + ": " + str(e))
+            time.sleep(random.uniform(5, 10))
+    return None
 
-            for c in comentarios.get("items", []):
-                autor = c["snippet"]["topLevelComment"]["snippet"]["authorDisplayName"]
-                texto = c["snippet"]["topLevelComment"]["snippet"]["textDisplay"].lower()
 
-                # 3. Filtrar solo comentarios con intencion de aprender/comprar
-                if any(p in texto for p in PALABRAS_CLAVE_INTENCION):
-                    leads.append({
-                        "autor": autor,
-                        "video": titulo,
-                        "comentario": texto[:200],
-                        "tipo_lead": "alta_intencion"
-                    })
-        except Exception as e:
-            # Algunos videos tienen comentarios desactivados, es normal
-            print("     (comentarios desactivados o error: " + str(e) + ")")
-
-        time.sleep(random.uniform(PAUSA_MIN, PAUSA_MAX))
-
-    return leads
+def extraer_titulo(html):
+    m = re.search(r"<title>(.*?)</title>", html, re.S)
+    if m:
+        return m.group(1).replace(" - YouTube", "").strip()
+    return None
 
 
 # ============================================================
-# METODO 2: SCRAPER WEB GENERICO (SOLO CON PERMISO / SITIOS PROPIOS)
+# PARSEO DEL JSON EMBEBIDO DE YOUTUBE
 # ============================================================
 
-class ScraperEtico:
-    """
-    Scraper generico que CUMPLE automaticamente las buenas practicas:
-    - Verifica robots.txt ANTES de cada dominio
-    - Pausas aleatorias entre solicitudes
-    - User-Agent transparente
-    """
-
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT})
-        self._robots_cache = {}
-
-    def respeta_robots(self, url):
-        """Devuelve True si robots.txt permite rastrear esa URL."""
-        dominio = urlparse(url).scheme + "://" + urlparse(url).netloc
-        if dominio not in self._robots_cache:
-            rp = robotparser.RobotFileParser()
-            rp.set_url(urljoin(dominio, "/robots.txt"))
+def extraer_yt_initial_data(html):
+    """Localiza 'var ytInitialData = {...};' y decodifica el JSON."""
+    idx = html.find("ytInitialData")
+    while idx != -1:
+        resto = html[idx:]
+        m = re.match(r'ytInitialData["\']?\s*(?:\]\s*)?=\s*', resto)
+        if m:
+            inicio = idx + m.end()
             try:
-                rp.read()
-                self._robots_cache[dominio] = rp
-            except Exception:
-                # Si no hay robots.txt, asumimos permitido pero con cautela
-                print("  ADVERTENCIA: No se pudo leer robots.txt de " + dominio)
-                return True
-        return self._robots_cache[dominio].can_fetch(USER_AGENT, url)
+                obj, _ = json.JSONDecoder().raw_decode(html[inicio:])
+                return obj
+            except json.JSONDecodeError:
+                pass
+        idx = html.find("ytInitialData", idx + 1)
+    return None
 
-    def obtener(self, url):
-        """Obtiene una pagina SOLO si robots.txt lo permite."""
-        if not self.respeta_robots(url):
-            print("  robots.txt PROHIBE: " + url + " -> se respeta y se omite.")
-            return None
 
-        print("  robots.txt permite: " + url)
-        time.sleep(random.uniform(PAUSA_MIN, PAUSA_MAX))  # pausa de cortesia
-        respuesta = self.session.get(url, timeout=15)
-        respuesta.raise_for_status()
-        return respuesta.text
+def extraer_innertube(html):
+    """Saca la API key interna y el contexto para paginar comentarios."""
+    m = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
+    api_key = m.group(1) if m else None
+    idx = html.find('"INNERTUBE_CONTEXT":')
+    contexto = None
+    if idx != -1:
+        inicio = html.find("{", idx)
+        try:
+            contexto, _ = json.JSONDecoder().raw_decode(html[inicio:])
+        except json.JSONDecodeError:
+            contexto = None
+    return api_key, contexto
 
-    def extraer_texto(self, html, selector="p"):
-        """Extrae texto de parrafos (ej: foros de crochet, blogs con permiso)."""
-        sopa = BeautifulSoup(html, "html.parser")
-        return [p.get_text(strip=True) for p in sopa.select(selector)
-                if len(p.get_text(strip=True)) > 30]
+
+def recoger_tokens(o, tokens):
+    """Recolecta tokens de continuacion ('ver mas comentarios')."""
+    if isinstance(o, dict):
+        cc = o.get("continuationCommand")
+        if isinstance(cc, dict) and isinstance(cc.get("token"), str):
+            tokens.append(cc["token"])
+        for v in o.values():
+            recoger_tokens(v, tokens)
+    elif isinstance(o, list):
+        for v in o:
+            recoger_tokens(v, tokens)
+
+
+def tokens_seccion_comentarios(data):
+    """Tokens de la seccion de comentarios en la pagina inicial."""
+    tokens = []
+
+    def rec(o):
+        if isinstance(o, dict):
+            sec = o.get("itemSectionRenderer")
+            if isinstance(sec, dict) and sec.get("sectionIdentifier") == "comment-item-section":
+                recoger_tokens(sec, tokens)
+            for v in o.values():
+                rec(v)
+        elif isinstance(o, list):
+            for v in o:
+                rec(v)
+
+    rec(data)
+    return tokens
+
+
+def acumular_comentarios(data, acum, vistos):
+    """Recorre el JSON y guarda cada comentario visible (sin duplicados)."""
+    def rec(o):
+        if isinstance(o, dict):
+            cr = o.get("commentRenderer")
+            if isinstance(cr, dict):
+                try:
+                    autor = cr["authorText"]["simpleText"]
+                    texto = "".join(
+                        r.get("text", "") for r in cr["contentText"]["runs"]
+                    ).strip()
+                    clave = (autor, texto)
+                    if texto and clave not in vistos:
+                        vistos.add(clave)
+                        acum.append({"autor": autor, "comentario": texto})
+                except (KeyError, TypeError):
+                    pass
+            for v in o.values():
+                rec(v)
+        elif isinstance(o, list):
+            for v in o:
+                rec(v)
+
+    rec(data)
+
+
+def cargar_continuacion(session, api_key, contexto, token):
+    url = "https://www.youtube.com/youtubei/v1/next?key=" + api_key
+    payload = {"context": contexto, "continuation": token}
+    r = session.post(url, json=payload, headers=HEADERS, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
 
 # ============================================================
-# EJEMPLO DE USO COMPLETO
+# ANALISIS POR VIDEO
 # ============================================================
+
+def analizar_video(session, url, paginas_extra=PAGINAS_EXTRA):
+    vid = id_de_video(url)
+    if not vid:
+        print("  URL no valida: " + url)
+        return vid, None, []
+
+    print("  Descargando: " + url)
+    watch = "https://www.youtube.com/watch?v=" + vid + "&hl=es"
+    html = obtener_html(session, watch)
+    if not html:
+        return vid, None, []
+
+    titulo = extraer_titulo(html) or vid
+    data = extraer_yt_initial_data(html)
+    if data is None:
+        print("    No se encontro ytInitialData (bloqueo o cambio de YouTube).")
+        return vid, titulo, []
+
+    comentarios, vistos = [], set()
+    acumular_comentarios(data, comentarios, vistos)
+    print("    Comentarios visibles en pagina inicial: " + str(len(comentarios)))
+
+    # Paginacion de comentarios (boton 'ver mas')
+    tokens = tokens_seccion_comentarios(data)
+    api_key, contexto = extraer_innertube(html)
+    pagina = 0
+    while pagina < paginas_extra and tokens and api_key and contexto:
+        token = tokens.pop(0)
+        time.sleep(random.uniform(PAUSA_MIN, PAUSA_MAX))  # cortesia
+        try:
+            resp = cargar_continuacion(session, api_key, contexto, token)
+        except requests.RequestException as e:
+            print("    Error paginando comentarios: " + str(e))
+            break
+        acumular_comentarios(resp, comentarios, vistos)
+        tokens = []
+        recoger_tokens(resp, tokens)
+        pagina += 1
+        print("    Pagina extra " + str(pagina) + ": total " + str(len(comentarios)))
+
+    return vid, titulo, comentarios
+
+
+# ============================================================
+# EJECUCION PRINCIPAL
+# ============================================================
+
+def main():
+    print("=" * 55)
+    print("LEAD FINDER ETICO (sin API) - Crochet para Aprender")
+    print("=" * 55)
+
+    if USER_AGENT.find("eldisyerar@gmail.com") != -1:
+        print("\nAVISO: pon TU correo en USER_AGENT antes de ejecutar.\n")
+
+    session = requests.Session()
+    leads = []
+    vistos_autores = set()
+
+    for url in VIDEOS:
+        vid, titulo, comentarios = analizar_video(session, url)
+        if not titulo:
+            continue
+        print("  Video: " + titulo)
+        nuevos = 0
+        for c in comentarios:
+            if es_intencion(c["comentario"]) and c["autor"] not in vistos_autores:
+                vistos_autores.add(c["autor"])
+                leads.append({
+                    "autor": c["autor"],
+                    "video": titulo,
+                    "video_id": vid,
+                    "comentario": c["comentario"][:200],
+                    "tipo_lead": "alta_intencion",
+                })
+                nuevos += 1
+        print("    -> Leads con intencion: " + str(nuevos))
+        time.sleep(random.uniform(PAUSA_MIN, PAUSA_MAX))  # cortesia entre videos
+
+    print("\nTotal de leads calificados: " + str(len(leads)))
+    for i, lead in enumerate(leads[:10], 1):
+        print("\n  " + str(i) + ". @" + lead["autor"])
+        print("     Video: " + lead["video"])
+        print("     Dice: " + lead["comentario"])
+
+    with open("leads_crochet.json", "w", encoding="utf-8") as f:
+        json.dump(leads, f, ensure_ascii=False, indent=2)
+    print("\nGuardado en leads_crochet.json")
+    print("Proceso finalizado con pausas de cortesia.")
+
 
 if __name__ == "__main__":
-
-    print("=" * 55)
-    print("LEAD FINDER ETICO - Crochet para Aprender")
-    print("=" * 55)
-
-    # ---- METODO 1: YouTube API ----
-    API_KEY = "PEGA_AQUI_TU_API_KEY_DE_GOOGLE"
-    # Obtén tu key gratis en: https://console.cloud.google.com
-
-    if API_KEY != "PEGA_AQUI_TU_API_KEY_DE_GOOGLE":
-        leads = buscar_leads_youtube(API_KEY)
-        print("\nSe encontraron " + str(len(leads)) + " leads calificados:")
-        for i, lead in enumerate(leads[:10], 1):
-            print("\n  " + str(i) + ". @" + lead["autor"])
-            print("     Video: " + lead["video"])
-            print("     Dice: " + lead["comentario"])
-        # Guardar resultados
-        with open("leads_crochet.json", "w", encoding="utf-8") as f:
-            json.dump(leads, f, ensure_ascii=False, indent=2)
-        print("\nGuardado en leads_crochet.json")
-    else:
-        print("\nConfigura tu API key de YouTube para el Metodo 1.")
-
-    # ---- METODO 2: Ejemplo de scraping con permiso ----
-    print("\n" + "-" * 55)
-    print("METODO 2 - Scraper web (solo sitios propios o con permiso)")
-    print("-" * 55)
-    scraper = ScraperEtico()
-    # Ejemplo: tu propio sitio web o un blog que te autorizo
-    # url = "https://tusitio-web-crochet.com/blog"
-    # html = scraper.obtener(url)
-    # if html:
-    #     parrafos = scraper.extraer_texto(html)
-    #     print("Extraidos " + str(len(parrafos)) + " parrafos")
-
-    print("\nProceso finalizado respetando robots.txt y pausas de cortesia.")
+    main()
