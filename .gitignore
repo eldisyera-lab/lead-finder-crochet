@@ -1,0 +1,4 @@
+leads_crochet.json
+__pycache__/
+*.pyc
+.venv/
