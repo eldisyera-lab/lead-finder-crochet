@@ -39,8 +39,8 @@ import requests
 # ============================================================
 # CONFIGURACION — EDITA ESTO
 # ============================================================
-USER_AGENT = "CrochetParaAprenderBot/1.0 (contacto: tuemail@ejemplo.com)"
-# IMPORTANTE: cambia 'tuemail@ejemplo.com' por TU correo real.
+USER_AGENT = "CrochetParaAprenderBot/1.0 (contacto: eldisyerar@gmail.com)"
+# IMPORTANTE: cambia 'eldisyerar@gmail.com' por TU correo real.
 
 PAUSA_MIN = 6        # segundos minimos entre solicitudes
 PAUSA_MAX = 12       # segundos maximos (aleatorio, comportamiento humano)
